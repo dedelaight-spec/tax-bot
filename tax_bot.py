@@ -254,6 +254,9 @@ async def debug_env(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Длина: {len(raw_value) if raw_value else 0}\n"
         f"Текущая переменная в коде: {USDT_WALLET_ADDRESS!r}"
     )
+
+
+async def grant(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Админ-команда для ручного подтверждения оплаты USDT.
     Использование: /grant <chat_id>
