@@ -1,11 +1,12 @@
 """
 Telegram-бот "Налоговый Компас" - помощник по НДС/УСН 2026
 Использует Claude API (через OpenRouter) для ответов на основе системного промпта.
-Поддерживает оплату через Telegram Stars и USDT (с ручным подтверждением).
+Поддерживает оплату через Telegram Stars (авто) и USDT (авто-проверка через блокчейн).
 """
 
 import os
 import logging
+import requests
 from datetime import date, datetime, timedelta
 from openai import OpenAI
 from telegram import Update, LabeledPrice, InlineKeyboardButton, InlineKeyboardMarkup
@@ -22,7 +23,7 @@ from telegram.ext import (
 # ── Настройки ──────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
-ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")  # твой личный chat_id для команд /grant
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
 USDT_WALLET_ADDRESS = os.environ.get("USDT_WALLET_ADDRESS", "УКАЖИ_СВОЙ_АДРЕС_В_ПЕРЕМЕННЫХ")
 
 if not TELEGRAM_TOKEN or not OPENROUTER_API_KEY:
@@ -41,6 +42,7 @@ MODEL_NAME = "anthropic/claude-sonnet-4.6"
 FREE_MESSAGES_PER_DAY = 5
 STARS_PRICE = 250  # звёзд в месяц (курс плавает, проверь актуальный на момент запуска)
 USDT_PRICE = 5  # долларов в месяц
+TRONSCAN_API = "https://apilist.tronscanapi.com/api/transaction-info"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -110,6 +112,7 @@ HELP_MESSAGE = (
     "напиши в этот же чат, разберёмся индивидуально.\n\n"
     "Команды:\n"
     "/subscribe - оформить подписку\n"
+    "/status - остаток бесплатных вопросов / статус подписки\n"
     "/reset - начать диалог заново\n"
     "/help - это сообщение"
 )
@@ -119,9 +122,8 @@ user_histories: dict[int, list[dict]] = {}
 MAX_HISTORY_MESSAGES = 10
 
 user_message_counts: dict[int, dict] = {}
-
-# Активные подписки: {chat_id: дата_окончания}
 subscriptions: dict[int, datetime] = {}
+used_txids: set[str] = set()  # чтобы один и тот же платёж нельзя было применить дважды
 
 
 def has_active_subscription(chat_id: int) -> bool:
@@ -130,7 +132,6 @@ def has_active_subscription(chat_id: int) -> bool:
 
 
 def check_and_increment_limit(chat_id: int) -> bool:
-    """True если лимит не исчерпан или есть активная подписка."""
     if has_active_subscription(chat_id):
         return True
 
@@ -162,6 +163,46 @@ def grant_subscription(chat_id: int, days: int = 30) -> None:
     subscriptions[chat_id] = base + timedelta(days=days)
 
 
+def verify_usdt_transaction(txid: str) -> tuple[bool, str]:
+    """
+    Проверяет транзакцию через публичный Tronscan API.
+    Возвращает (успех, сообщение_с_подробностями).
+    """
+    if txid in used_txids:
+        return False, "Этот хэш транзакции уже был использован ранее."
+
+    try:
+        resp = requests.get(TRONSCAN_API, params={"hash": txid}, timeout=10)
+        data = resp.json()
+    except Exception:
+        logger.exception("Ошибка запроса к Tronscan API")
+        return False, "Не удалось проверить транзакцию (проблема связи с блокчейном). Попробуй ещё раз через минуту."
+
+    if not data or data.get("contractRet") != "SUCCESS":
+        return False, "Транзакция не найдена или ещё не подтверждена в блокчейне. Подожди пару минут и попробуй снова."
+
+    transfers = data.get("trc20TransferInfo", [])
+    if not transfers:
+        return False, "В этой транзакции не найден перевод USDT (TRC-20)."
+
+    for t in transfers:
+        token_abbr = t.get("tokenInfo", {}).get("tokenAbbr", "")
+        to_address = t.get("to_address", "")
+        decimals = t.get("tokenInfo", {}).get("tokenDecimal", 6)
+        try:
+            amount = float(t.get("amount_str", "0")) / (10 ** decimals)
+        except (ValueError, TypeError):
+            amount = 0
+
+        if token_abbr == "USDT" and to_address == USDT_WALLET_ADDRESS and amount >= USDT_PRICE - 0.01:
+            return True, f"Оплата подтверждена: {amount:.2f} USDT"
+
+    return False, (
+        "Перевод USDT на нужный адрес и нужную сумму не найден в этой транзакции. "
+        "Проверь, что отправил именно на указанный адрес и не меньше нужной суммы."
+    )
+
+
 # ── Команды ──────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -175,11 +216,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_histories[update.effective_chat.id] = []
+    context.user_data["awaiting_usdt_txid"] = False
     await update.message.reply_text("Диалог сброшен, начнём заново 🙂")
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Показывает пользователю остаток бесплатных вопросов или статус подписки."""
     chat_id = update.effective_chat.id
     if has_active_subscription(chat_id):
         expiry = subscriptions[chat_id].strftime("%d.%m.%Y")
@@ -193,7 +234,6 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Показывает варианты оплаты красивыми кнопками."""
     chat_id = update.effective_chat.id
 
     if has_active_subscription(chat_id):
@@ -213,7 +253,6 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def subscribe_button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обрабатывает нажатие на кнопки выбора способа оплаты."""
     query = update.callback_query
     await query.answer()
 
@@ -224,7 +263,6 @@ async def subscribe_button_callback(update: Update, context: ContextTypes.DEFAUL
 
 
 async def send_stars_invoice(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Отправляет инвойс на оплату через Telegram Stars."""
     prices = [LabeledPrice("Подписка на месяц", STARS_PRICE)]
 
     await context.bot.send_invoice(
@@ -232,21 +270,25 @@ async def send_stars_invoice(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -
         title="Налоговый Компас - подписка на месяц",
         description="Безлимитные вопросы по НДС и УСН на 30 дней",
         payload=f"subscription_{chat_id}",
-        provider_token="",  # для Stars provider_token оставляем пустым
+        provider_token="",
         currency="XTR",
         prices=prices,
     )
 
 
 async def send_usdt_instructions(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Инструкция по оплате в USDT. chat_id пользователю не показываем - бот сам знает кто пишет."""
+    """
+    Инструкция по оплате в USDT. После этого бот переходит в режим ожидания хэша -
+    пользователь просто присылает TXID обычным сообщением, без команд.
+    """
+    context.user_data["awaiting_usdt_txid"] = True
+
     text = (
         f"Отправь ${USDT_PRICE} в USDT (сеть TRC-20) на адрес:\n\n"
         f"`{USDT_WALLET_ADDRESS}`\n\n"
-        "После оплаты пришли сюда команду:\n"
-        "/paid ТВОЙ_ХЭШ_ТРАНЗАКЦИИ\n\n"
-        "Например: /paid 4a7f9c2e1b8d3f6a5c0e9b2d1f8a7c6e\n\n"
-        "Я проверю платёж и активирую подписку в течение нескольких часов."
+        "После оплаты просто пришли сюда хэш транзакции (TXID) одним сообщением - "
+        "никаких команд вводить не нужно. Бот сам проверит платёж в блокчейне "
+        "и активирует подписку автоматически, обычно в течение минуты."
     )
     try:
         await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
@@ -255,9 +297,7 @@ async def send_usdt_instructions(chat_id: int, context: ContextTypes.DEFAULT_TYP
         plain_text = (
             f"Отправь ${USDT_PRICE} в USDT (сеть TRC-20) на адрес:\n\n"
             f"{USDT_WALLET_ADDRESS}\n\n"
-            "После оплаты пришли сюда команду:\n"
-            "/paid ТВОЙ_ХЭШ_ТРАНЗАКЦИИ\n\n"
-            "Я проверю платёж и активирую подписку в течение нескольких часов."
+            "После оплаты просто пришли сюда хэш транзакции (TXID) одним сообщением."
         )
         await context.bot.send_message(chat_id=chat_id, text=plain_text)
 
@@ -270,43 +310,58 @@ async def pay_usdt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_usdt_instructions(update.effective_chat.id, context)
 
 
-async def paid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Пользователь вызывает после отправки USDT: /paid <TXID>
-    Бот сам знает chat_id пользователя - ничего вводить вручную не нужно.
-    Админу приходит уведомление с готовой командой /grant для подтверждения.
-    """
+async def process_usdt_txid(update: Update, context: ContextTypes.DEFAULT_TYPE, txid: str) -> None:
+    """Автоматическая проверка присланного хэша транзакции и выдача подписки."""
     chat_id = update.effective_chat.id
     username = update.effective_user.username or update.effective_user.first_name or str(chat_id)
-    txid = " ".join(context.args) if context.args else "не указан"
 
-    await update.message.reply_text(
-        "Спасибо! Заявка принята, проверю платёж и активирую подписку в ближайшее время 🙏"
-    )
+    await update.message.reply_text("Проверяю транзакцию в блокчейне, подожди немного... ⏳")
 
-    if ADMIN_CHAT_ID:
-        try:
-            await context.bot.send_message(
-                chat_id=ADMIN_CHAT_ID,
-                text=(
-                    f"💰 Новый платёж USDT\n\n"
-                    f"От: @{username}\n"
-                    f"TXID: {txid}\n\n"
-                    f"Подтвердить: /grant {chat_id}"
-                ),
-            )
-        except Exception:
-            logger.warning("Не удалось уведомить админа о новом платеже")
+    success, message = verify_usdt_transaction(txid.strip())
+
+    if success:
+        used_txids.add(txid.strip())
+        grant_subscription(chat_id, days=30)
+        expiry = subscriptions[chat_id].strftime("%d.%m.%Y")
+        await update.message.reply_text(
+            f"✅ {message}\n\nПодписка активирована до {expiry}. "
+            "Теперь можно задавать сколько угодно вопросов."
+        )
+        if ADMIN_CHAT_ID:
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_CHAT_ID,
+                    text=f"✅ Автоматически подтверждён платёж USDT\nОт: @{username} (chat_id: {chat_id})\nTXID: {txid}",
+                )
+            except Exception:
+                pass
+    else:
+        await update.message.reply_text(
+            f"⚠️ {message}\n\n"
+            "Если уверен, что оплата прошла корректно - напиши в этот же чат, разберёмся вручную."
+        )
+        if ADMIN_CHAT_ID:
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_CHAT_ID,
+                    text=(
+                        f"⚠️ Не удалось авто-подтвердить платёж\n"
+                        f"От: @{username} (chat_id: {chat_id})\n"
+                        f"TXID: {txid}\n"
+                        f"Причина: {message}\n\n"
+                        f"Если платёж реальный - подтверди вручную: /grant {chat_id}"
+                    ),
+                )
+            except Exception:
+                pass
 
 
 async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обязательный шаг перед оплатой Stars - подтверждаем что всё ок."""
     query = update.pre_checkout_query
     await query.answer(ok=True)
 
 
 async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Срабатывает после успешной оплаты через Stars."""
     chat_id = update.effective_chat.id
     grant_subscription(chat_id, days=30)
     expiry = subscriptions[chat_id].strftime("%d.%m.%Y")
@@ -317,14 +372,10 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
 
 
 async def grant(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Админ-команда для ручного подтверждения оплаты USDT.
-    Использование: /grant <chat_id>
-    Доступна только тебе (ADMIN_CHAT_ID).
-    """
+    """Админ-команда для ручного подтверждения оплаты, на случай если авто-проверка не сработала."""
     caller_id = str(update.effective_chat.id)
     if not ADMIN_CHAT_ID or caller_id != ADMIN_CHAT_ID:
-        return  # молча игнорируем, если пишет не админ
+        return
 
     if not context.args:
         await update.message.reply_text("Использование: /grant <chat_id>")
@@ -355,6 +406,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     chat_id = update.effective_chat.id
     user_text = update.message.text
     username = update.effective_user.username or update.effective_user.first_name or str(chat_id)
+
+    # Если бот ждёт хэш транзакции - обрабатываем именно его, а не как вопрос про налоги
+    if context.user_data.get("awaiting_usdt_txid"):
+        context.user_data["awaiting_usdt_txid"] = False
+        await process_usdt_txid(update, context, user_text)
+        return
 
     questions_logger.info(f"user={username} | chat_id={chat_id} | question={user_text}")
 
@@ -394,7 +451,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def post_init(application: Application) -> None:
-    """Настраивает красивое меню команд, всплывающее у пользователя в Telegram."""
+    """Настраивает меню команд, всплывающее у пользователя в Telegram."""
     commands = [
         ("start", "Начать работу с ботом"),
         ("subscribe", "Оформить безлимитную подписку"),
@@ -415,7 +472,6 @@ def main() -> None:
     app.add_handler(CommandHandler("subscribe", subscribe))
     app.add_handler(CommandHandler("pay_stars", pay_stars))
     app.add_handler(CommandHandler("pay_usdt", pay_usdt))
-    app.add_handler(CommandHandler("paid", paid))
     app.add_handler(CommandHandler("grant", grant))
     app.add_handler(CallbackQueryHandler(subscribe_button_callback))
     app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
