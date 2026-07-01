@@ -38,11 +38,8 @@ client = OpenAI(
 
 MODEL_NAME = "anthropic/claude-sonnet-4.6"
 
-# Лимит бесплатных сообщений в день на пользователя
 FREE_MESSAGES_PER_DAY = 5
-
-# Стоимость подписки
-STARS_PRICE = 250  # звёзд в месяц, примерно $5 (курс звёзд плавает, проверь актуальный на момент запуска)
+STARS_PRICE = 250  # звёзд в месяц (курс плавает, проверь актуальный на момент запуска)
 USDT_PRICE = 5  # долларов в месяц
 
 logging.basicConfig(level=logging.INFO)
@@ -91,9 +88,30 @@ START_MESSAGE = (
     "• «Есть ли льготы по НДС для IT-компаний?»\n\n"
     f"У тебя есть {FREE_MESSAGES_PER_DAY} бесплатных вопросов в день.\n\n"
     "⚠️ Я не заменяю бухгалтера, а помогаю разобраться в общих правилах.\n\n"
+    "Команда /help - подробнее о боте и правилах использования."
+)
+
+HELP_MESSAGE = (
+    "ℹ️ О боте\n\n"
+    "Налоговый Компас объясняет изменения по НДС и УСН, действующие с 1 января 2026 года: "
+    "ставки, пороги, лимиты. Отвечает простым языком на основе актуальных норм.\n\n"
+    "⚠️ Важно понимать\n\n"
+    "Бот не заменяет бухгалтера и не даёт официальных консультаций. Ответы носят "
+    "общий информационный характер. Для решений с финансовыми последствиями "
+    "сверяйтесь с бухгалтером или напрямую с ФНС.\n\n"
+    "🔒 О данных\n\n"
+    "Вопросы, которые ты задаёшь, сохраняются в техническом логе, чтобы дорабатывать "
+    "качество ответов бота. Личные данные (кроме имени пользователя Telegram) не запрашиваются "
+    "и не передаются третьим лицам.\n\n"
+    f"💳 Подписка\n\n"
+    f"Бесплатно: {FREE_MESSAGES_PER_DAY} вопросов в день. "
+    f"Безлимитная подписка: {STARS_PRICE} ⭐ или ${USDT_PRICE} в USDT за 30 дней. Оформить: /subscribe\n\n"
+    "Возврат средств: если подписка не была активирована по ошибке бота - "
+    "напиши в этот же чат, разберёмся индивидуально.\n\n"
     "Команды:\n"
-    "/subscribe - безлимитный доступ по подписке\n"
-    "/reset - начать диалог заново"
+    "/subscribe - оформить подписку\n"
+    "/reset - начать диалог заново\n"
+    "/help - это сообщение"
 )
 
 # ── Хранилища данных (в памяти - для MVP достаточно) ──────────────────
@@ -130,6 +148,14 @@ def check_and_increment_limit(chat_id: int) -> bool:
     return True
 
 
+def remaining_free_messages(chat_id: int) -> int:
+    today = str(date.today())
+    record = user_message_counts.get(chat_id)
+    if record is None or record["date"] != today:
+        return FREE_MESSAGES_PER_DAY
+    return max(0, FREE_MESSAGES_PER_DAY - record["count"])
+
+
 def grant_subscription(chat_id: int, days: int = 30) -> None:
     current_expiry = subscriptions.get(chat_id)
     base = current_expiry if current_expiry and current_expiry > datetime.now() else datetime.now()
@@ -143,9 +169,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(START_MESSAGE)
 
 
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(HELP_MESSAGE)
+
+
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_histories[update.effective_chat.id] = []
     await update.message.reply_text("Диалог сброшен, начнём заново 🙂")
+
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показывает пользователю остаток бесплатных вопросов или статус подписки."""
+    chat_id = update.effective_chat.id
+    if has_active_subscription(chat_id):
+        expiry = subscriptions[chat_id].strftime("%d.%m.%Y")
+        await update.message.reply_text(f"У тебя активная подписка до {expiry} 🎉")
+    else:
+        left = remaining_free_messages(chat_id)
+        await update.message.reply_text(
+            f"Осталось бесплатных вопросов сегодня: {left} из {FREE_MESSAGES_PER_DAY}.\n"
+            "Безлимит: /subscribe"
+        )
 
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -195,13 +239,14 @@ async def send_stars_invoice(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def send_usdt_instructions(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Инструкция по оплате в USDT с ручным подтверждением."""
+    """Инструкция по оплате в USDT. chat_id пользователю не показываем - бот сам знает кто пишет."""
     text = (
         f"Отправь ${USDT_PRICE} в USDT (сеть TRC-20) на адрес:\n\n"
         f"`{USDT_WALLET_ADDRESS}`\n\n"
-        "После оплаты пришли сюда хэш транзакции (TXID) - "
-        "я проверю и активирую подписку в течение нескольких часов.\n\n"
-        f"Твой chat_id для справки: `{chat_id}`"
+        "После оплаты пришли сюда команду:\n"
+        "/paid ТВОЙ_ХЭШ_ТРАНЗАКЦИИ\n\n"
+        "Например: /paid 4a7f9c2e1b8d3f6a5c0e9b2d1f8a7c6e\n\n"
+        "Я проверю платёж и активирую подписку в течение нескольких часов."
     )
     try:
         await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
@@ -210,9 +255,9 @@ async def send_usdt_instructions(chat_id: int, context: ContextTypes.DEFAULT_TYP
         plain_text = (
             f"Отправь ${USDT_PRICE} в USDT (сеть TRC-20) на адрес:\n\n"
             f"{USDT_WALLET_ADDRESS}\n\n"
-            "После оплаты пришли сюда хэш транзакции (TXID) - "
-            "я проверю и активирую подписку в течение нескольких часов.\n\n"
-            f"Твой chat_id для справки: {chat_id}"
+            "После оплаты пришли сюда команду:\n"
+            "/paid ТВОЙ_ХЭШ_ТРАНЗАКЦИИ\n\n"
+            "Я проверю платёж и активирую подписку в течение нескольких часов."
         )
         await context.bot.send_message(chat_id=chat_id, text=plain_text)
 
@@ -223,6 +268,35 @@ async def pay_stars(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def pay_usdt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_usdt_instructions(update.effective_chat.id, context)
+
+
+async def paid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Пользователь вызывает после отправки USDT: /paid <TXID>
+    Бот сам знает chat_id пользователя - ничего вводить вручную не нужно.
+    Админу приходит уведомление с готовой командой /grant для подтверждения.
+    """
+    chat_id = update.effective_chat.id
+    username = update.effective_user.username or update.effective_user.first_name or str(chat_id)
+    txid = " ".join(context.args) if context.args else "не указан"
+
+    await update.message.reply_text(
+        "Спасибо! Заявка принята, проверю платёж и активирую подписку в ближайшее время 🙏"
+    )
+
+    if ADMIN_CHAT_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=(
+                    f"💰 Новый платёж USDT\n\n"
+                    f"От: @{username}\n"
+                    f"TXID: {txid}\n\n"
+                    f"Подтвердить: /grant {chat_id}"
+                ),
+            )
+        except Exception:
+            logger.warning("Не удалось уведомить админа о новом платеже")
 
 
 async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -239,17 +313,6 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
     await update.message.reply_text(
         f"Оплата прошла успешно! ✅ Подписка активна до {expiry}.\n"
         "Теперь можно задавать сколько угодно вопросов."
-    )
-
-
-async def debug_env(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Временная диагностическая команда - показывает что реально видит бот в переменных."""
-    raw_value = os.environ.get("USDT_WALLET_ADDRESS")
-    raw_admin = os.environ.get("ADMIN_CHAT_ID")
-    await update.message.reply_text(
-        f"USDT_WALLET_ADDRESS (repr): {raw_value!r}\n"
-        f"ADMIN_CHAT_ID (repr): {raw_admin!r}\n"
-        f"Твой chat_id: {update.effective_chat.id!r}"
     )
 
 
@@ -335,6 +398,8 @@ async def post_init(application: Application) -> None:
     commands = [
         ("start", "Начать работу с ботом"),
         ("subscribe", "Оформить безлимитную подписку"),
+        ("status", "Сколько вопросов осталось / статус подписки"),
+        ("help", "О боте и правилах использования"),
         ("reset", "Начать диалог заново"),
     ]
     await application.bot.set_my_commands(commands)
@@ -344,12 +409,14 @@ def main() -> None:
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("subscribe", subscribe))
     app.add_handler(CommandHandler("pay_stars", pay_stars))
     app.add_handler(CommandHandler("pay_usdt", pay_usdt))
+    app.add_handler(CommandHandler("paid", paid))
     app.add_handler(CommandHandler("grant", grant))
-    app.add_handler(CommandHandler("debug_env", debug_env))
     app.add_handler(CallbackQueryHandler(subscribe_button_callback))
     app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
