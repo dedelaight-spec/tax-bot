@@ -101,7 +101,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
     history.append({"role": "assistant", "content": answer})
-    await update.message.reply_text(answer)
+    try:
+        await update.message.reply_text(answer, parse_mode="Markdown")
+    except Exception:
+        # Если Markdown сломан (например, незакрытые звёздочки) — шлём как обычный текст
+        await update.message.reply_text(answer)
 
 
 def main() -> None:
