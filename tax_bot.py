@@ -244,15 +244,12 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
 
 async def debug_env(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Временная диагностическая команда - показывает что реально видит бот в переменных."""
-    caller_id = str(update.effective_chat.id)
-    if not ADMIN_CHAT_ID or caller_id != ADMIN_CHAT_ID:
-        return
-
     raw_value = os.environ.get("USDT_WALLET_ADDRESS")
+    raw_admin = os.environ.get("ADMIN_CHAT_ID")
     await update.message.reply_text(
-        f"Значение переменной (repr): {raw_value!r}\n"
-        f"Длина: {len(raw_value) if raw_value else 0}\n"
-        f"Текущая переменная в коде: {USDT_WALLET_ADDRESS!r}"
+        f"USDT_WALLET_ADDRESS (repr): {raw_value!r}\n"
+        f"ADMIN_CHAT_ID (repr): {raw_admin!r}\n"
+        f"Твой chat_id: {update.effective_chat.id!r}"
     )
 
 
