@@ -242,7 +242,18 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
     )
 
 
-async def grant(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def debug_env(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Временная диагностическая команда - показывает что реально видит бот в переменных."""
+    caller_id = str(update.effective_chat.id)
+    if not ADMIN_CHAT_ID or caller_id != ADMIN_CHAT_ID:
+        return
+
+    raw_value = os.environ.get("USDT_WALLET_ADDRESS")
+    await update.message.reply_text(
+        f"Значение переменной (repr): {raw_value!r}\n"
+        f"Длина: {len(raw_value) if raw_value else 0}\n"
+        f"Текущая переменная в коде: {USDT_WALLET_ADDRESS!r}"
+    )
     """
     Админ-команда для ручного подтверждения оплаты USDT.
     Использование: /grant <chat_id>
@@ -338,6 +349,7 @@ def main() -> None:
     app.add_handler(CommandHandler("pay_stars", pay_stars))
     app.add_handler(CommandHandler("pay_usdt", pay_usdt))
     app.add_handler(CommandHandler("grant", grant))
+    app.add_handler(CommandHandler("debug_env", debug_env))
     app.add_handler(CallbackQueryHandler(subscribe_button_callback))
     app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
