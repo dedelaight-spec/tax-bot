@@ -5,6 +5,7 @@ Telegram-бот "Налоговый Компас" - помощник по НДС
 """
 
 import os
+import re
 import logging
 import requests
 from datetime import date, datetime, timedelta
@@ -43,6 +44,7 @@ FREE_MESSAGES_PER_DAY = 5
 STARS_PRICE = 250  # звёзд в месяц (курс плавает, проверь актуальный на момент запуска)
 USDT_PRICE = 5  # долларов в месяц
 TRONSCAN_API = "https://apilist.tronscanapi.com/api/transaction-info"
+TXID_PATTERN = re.compile(r"^[a-fA-F0-9]{64}$")  # TRC-20 хэш транзакции - всегда 64 hex-символа
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -198,8 +200,12 @@ def verify_usdt_transaction(txid: str) -> tuple[bool, str]:
             return True, f"Оплата подтверждена: {amount:.2f} USDT"
 
     return False, (
-        "Перевод USDT на нужный адрес и нужную сумму не найден в этой транзакции. "
-        "Проверь, что отправил именно на указанный адрес и не меньше нужной суммы."
+        "Перевод USDT на нужный адрес и нужную сумму не найден в этой транзакции.\n\n"
+        "Частые причины:\n"
+        "- Отправлено не в сети TRC-20 (например, по ошибке ERC-20 или BEP-20)\n"
+        "- Адрес получателя не совпадает\n"
+        "- Сумма меньше требуемой\n"
+        "- Транзакция ещё не подтвердилась в блокчейне (подожди 1-2 минуты)"
     )
 
 
@@ -406,12 +412,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     chat_id = update.effective_chat.id
     user_text = update.message.text
     username = update.effective_user.username or update.effective_user.first_name or str(chat_id)
+    text_stripped = user_text.strip()
 
-    # Если бот ждёт хэш транзакции - обрабатываем именно его, а не как вопрос про налоги
-    if context.user_data.get("awaiting_usdt_txid"):
+    # Хэш транзакции распознаём по формату (64 hex-символа) - это надёжнее,
+    # чем полагаться только на "режим ожидания". Работает даже если пользователь
+    # ошибся в первый раз и присылает исправленный хэш заново, без повторного нажатия кнопки.
+    if TXID_PATTERN.match(text_stripped):
         context.user_data["awaiting_usdt_txid"] = False
-        await process_usdt_txid(update, context, user_text)
+        await process_usdt_txid(update, context, text_stripped)
         return
+
+    # Если бот ждал хэш, но получил что-то на него не похожее - не молчим и не ломаем диалог,
+    # а мягко поясняем и продолжаем как обычный вопрос (вдруг это правда был вопрос про налоги)
+    was_awaiting_txid = context.user_data.get("awaiting_usdt_txid", False)
+    if was_awaiting_txid:
+        context.user_data["awaiting_usdt_txid"] = False
 
     questions_logger.info(f"user={username} | chat_id={chat_id} | question={user_text}")
 
