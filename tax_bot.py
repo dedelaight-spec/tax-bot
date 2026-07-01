@@ -192,7 +192,19 @@ async def pay_usdt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "я проверю и активирую подписку в течение нескольких часов.\n\n"
         f"Твой chat_id для справки: `{chat_id}`"
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    try:
+        await update.message.reply_text(text, parse_mode="Markdown")
+    except Exception:
+        logger.exception("Ошибка отправки сообщения pay_usdt (возможно, проблема с USDT_WALLET_ADDRESS)")
+        # Отправляем без форматирования, чтобы точно дошло
+        plain_text = (
+            f"Отправь ${USDT_PRICE} в USDT (сеть TRC-20) на адрес:\n\n"
+            f"{USDT_WALLET_ADDRESS}\n\n"
+            "После оплаты пришли сюда хэш транзакции (TXID) - "
+            "я проверю и активирую подписку в течение нескольких часов.\n\n"
+            f"Твой chat_id для справки: {chat_id}"
+        )
+        await update.message.reply_text(plain_text)
 
 
 async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
