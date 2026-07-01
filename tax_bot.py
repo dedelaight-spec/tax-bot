@@ -126,6 +126,9 @@ MAX_HISTORY_MESSAGES = 10
 user_message_counts: dict[int, dict] = {}
 subscriptions: dict[int, datetime] = {}
 used_txids: set[str] = set()  # чтобы один и тот же платёж нельзя было применить дважды
+usdt_verify_attempts: dict[int, list] = {}  # {chat_id: [timestamp, timestamp, ...]} для анти-спама
+
+MAX_VERIFY_ATTEMPTS_PER_HOUR = 8
 
 
 def has_active_subscription(chat_id: int) -> bool:
@@ -165,9 +168,25 @@ def grant_subscription(chat_id: int, days: int = 30) -> None:
     subscriptions[chat_id] = base + timedelta(days=days)
 
 
-def verify_usdt_transaction(txid: str) -> tuple[bool, str]:
+def check_verify_rate_limit(chat_id: int) -> bool:
+    """True если можно попробовать ещё раз, False если превышен лимит попыток в час."""
+    now = datetime.now()
+    attempts = usdt_verify_attempts.setdefault(chat_id, [])
+    # чистим попытки старше часа
+    attempts[:] = [t for t in attempts if now - t < timedelta(hours=1)]
+
+    if len(attempts) >= MAX_VERIFY_ATTEMPTS_PER_HOUR:
+        return False
+
+    attempts.append(now)
+    return True
+
+
+def verify_usdt_transaction(txid: str, request_timestamp: float) -> tuple[bool, str]:
     """
     Проверяет транзакцию через публичный Tronscan API.
+    request_timestamp - момент, когда пользователь запросил оплату (защита от подмены
+    чужой старой публичной транзакции, случайно найденной в блокчейн-эксплорере).
     Возвращает (успех, сообщение_с_подробностями).
     """
     if txid in used_txids:
@@ -182,6 +201,17 @@ def verify_usdt_transaction(txid: str) -> tuple[bool, str]:
 
     if not data or data.get("contractRet") != "SUCCESS":
         return False, "Транзакция не найдена или ещё не подтверждена в блокчейне. Подожди пару минут и попробуй снова."
+
+    # Защита от подмены: транзакция должна была произойти ПОСЛЕ того, как пользователь запросил оплату.
+    # Без этого кто угодно мог бы найти чужой старый публичный перевод на этот адрес и подсунуть его хэш.
+    tx_timestamp_ms = data.get("timestamp", 0)
+    tx_timestamp = tx_timestamp_ms / 1000 if tx_timestamp_ms else 0
+    buffer_seconds = 300  # запас на разницу часов/задержки сети
+    if tx_timestamp and tx_timestamp < (request_timestamp - buffer_seconds):
+        return False, (
+            "Эта транзакция была совершена до того, как ты запросил оплату. "
+            "Пришли хэш именно своего нового перевода."
+        )
 
     transfers = data.get("trc20TransferInfo", [])
     if not transfers:
@@ -288,13 +318,13 @@ async def send_usdt_instructions(chat_id: int, context: ContextTypes.DEFAULT_TYP
     пользователь просто присылает TXID обычным сообщением, без команд.
     """
     context.user_data["awaiting_usdt_txid"] = True
+    context.user_data["usdt_requested_at"] = datetime.now().timestamp()
 
     text = (
         f"Отправь ${USDT_PRICE} в USDT (сеть TRC-20) на адрес:\n\n"
         f"`{USDT_WALLET_ADDRESS}`\n\n"
-        "После оплаты просто пришли сюда хэш транзакции (TXID) одним сообщением - "
-        "никаких команд вводить не нужно. Бот сам проверит платёж в блокчейне "
-        "и активирует подписку автоматически, обычно в течение минуты."
+        "После оплаты просто пришли сюда хэш транзакции (TXID) - "
+        "проверю платёж и активирую подписку автоматически, обычно в течение минуты."
     )
     try:
         await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
@@ -303,7 +333,8 @@ async def send_usdt_instructions(chat_id: int, context: ContextTypes.DEFAULT_TYP
         plain_text = (
             f"Отправь ${USDT_PRICE} в USDT (сеть TRC-20) на адрес:\n\n"
             f"{USDT_WALLET_ADDRESS}\n\n"
-            "После оплаты просто пришли сюда хэш транзакции (TXID) одним сообщением."
+            "После оплаты просто пришли сюда хэш транзакции (TXID) - "
+            "проверю платёж и активирую подписку автоматически."
         )
         await context.bot.send_message(chat_id=chat_id, text=plain_text)
 
@@ -321,9 +352,17 @@ async def process_usdt_txid(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     chat_id = update.effective_chat.id
     username = update.effective_user.username or update.effective_user.first_name or str(chat_id)
 
+    if not check_verify_rate_limit(chat_id):
+        await update.message.reply_text(
+            "Слишком много попыток проверки за последний час. "
+            "Попробуй позже, либо напиши в этот чат - разберёмся вручную."
+        )
+        return
+
     await update.message.reply_text("Проверяю транзакцию в блокчейне, подожди немного... ⏳")
 
-    success, message = verify_usdt_transaction(txid.strip())
+    request_timestamp = context.user_data.get("usdt_requested_at", datetime.now().timestamp() - 86400)
+    success, message = verify_usdt_transaction(txid.strip(), request_timestamp)
 
     if success:
         used_txids.add(txid.strip())
