@@ -8,12 +8,13 @@ import os
 import logging
 from datetime import date, datetime, timedelta
 from openai import OpenAI
-from telegram import Update, LabeledPrice
+from telegram import Update, LabeledPrice, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     PreCheckoutQueryHandler,
+    CallbackQueryHandler,
     filters,
     ContextTypes,
 )
@@ -148,7 +149,7 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Показывает варианты оплаты."""
+    """Показывает варианты оплаты красивыми кнопками."""
     chat_id = update.effective_chat.id
 
     if has_active_subscription(chat_id):
@@ -156,19 +157,30 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"У тебя уже есть активная подписка до {expiry} 🎉")
         return
 
-    text = (
-        "💳 Безлимитная подписка на месяц\n\n"
-        f"Вариант 1 - Telegram Stars ({STARS_PRICE} ⭐):\n"
-        "/pay_stars\n\n"
-        f"Вариант 2 - USDT (${USDT_PRICE}):\n"
-        "/pay_usdt"
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"⭐ Telegram Stars ({STARS_PRICE})", callback_data="pay_stars")],
+        [InlineKeyboardButton(f"💵 USDT (${USDT_PRICE})", callback_data="pay_usdt")],
+    ])
+
+    await update.message.reply_text(
+        "💳 Безлимитная подписка на месяц\n\nВыбери удобный способ оплаты:",
+        reply_markup=keyboard,
     )
-    await update.message.reply_text(text)
 
 
-async def pay_stars(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def subscribe_button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает нажатие на кнопки выбора способа оплаты."""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "pay_stars":
+        await send_stars_invoice(query.message.chat_id, context)
+    elif query.data == "pay_usdt":
+        await send_usdt_instructions(query.message.chat_id, context)
+
+
+async def send_stars_invoice(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Отправляет инвойс на оплату через Telegram Stars."""
-    chat_id = update.effective_chat.id
     prices = [LabeledPrice("Подписка на месяц", STARS_PRICE)]
 
     await context.bot.send_invoice(
@@ -182,9 +194,8 @@ async def pay_stars(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def pay_usdt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def send_usdt_instructions(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Инструкция по оплате в USDT с ручным подтверждением."""
-    chat_id = update.effective_chat.id
     text = (
         f"Отправь ${USDT_PRICE} в USDT (сеть TRC-20) на адрес:\n\n"
         f"`{USDT_WALLET_ADDRESS}`\n\n"
@@ -193,10 +204,9 @@ async def pay_usdt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Твой chat_id для справки: `{chat_id}`"
     )
     try:
-        await update.message.reply_text(text, parse_mode="Markdown")
+        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
     except Exception:
         logger.exception("Ошибка отправки сообщения pay_usdt (возможно, проблема с USDT_WALLET_ADDRESS)")
-        # Отправляем без форматирования, чтобы точно дошло
         plain_text = (
             f"Отправь ${USDT_PRICE} в USDT (сеть TRC-20) на адрес:\n\n"
             f"{USDT_WALLET_ADDRESS}\n\n"
@@ -204,7 +214,15 @@ async def pay_usdt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "я проверю и активирую подписку в течение нескольких часов.\n\n"
             f"Твой chat_id для справки: {chat_id}"
         )
-        await update.message.reply_text(plain_text)
+        await context.bot.send_message(chat_id=chat_id, text=plain_text)
+
+
+async def pay_stars(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_stars_invoice(update.effective_chat.id, context)
+
+
+async def pay_usdt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_usdt_instructions(update.effective_chat.id, context)
 
 
 async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -320,6 +338,7 @@ def main() -> None:
     app.add_handler(CommandHandler("pay_stars", pay_stars))
     app.add_handler(CommandHandler("pay_usdt", pay_usdt))
     app.add_handler(CommandHandler("grant", grant))
+    app.add_handler(CallbackQueryHandler(subscribe_button_callback))
     app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
