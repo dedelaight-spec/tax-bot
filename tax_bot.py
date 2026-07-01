@@ -398,7 +398,7 @@ async def send_stars_invoice(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -
     await context.bot.send_invoice(
         chat_id=chat_id,
         title="Налоговый Компас - подписка на месяц",
-        description="Безлимитные вопросы по НДС и УСН на 30 дней",
+        description="Безлимитные вопросы по налогам и отчётности на 30 дней",
         payload=f"subscription_{chat_id}",
         provider_token="",
         currency="XTR",
