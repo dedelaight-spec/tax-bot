@@ -2,10 +2,13 @@
 Telegram-бот "Налоговый Компас" - помощник по НДС/УСН 2026
 Использует Claude API (через OpenRouter) для ответов на основе системного промпта.
 Поддерживает оплату через Telegram Stars (авто) и USDT (авто-проверка через блокчейн).
+Данные о подписках/лимитах хранятся в SQLite - переживают перезапуски и деплои
+(при условии подключённого Railway Volume, см. инструкцию).
 """
 
 import os
 import re
+import sqlite3
 import logging
 import requests
 from datetime import date, datetime, timedelta
@@ -26,6 +29,9 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
 USDT_WALLET_ADDRESS = os.environ.get("USDT_WALLET_ADDRESS", "УКАЖИ_СВОЙ_АДРЕС_В_ПЕРЕМЕННЫХ")
+# Путь к базе данных - ОБЯЗАТЕЛЬНО указать путь внутри примонтированного Volume в Railway,
+# иначе база будет стираться при каждом деплое. По умолчанию - локальный файл (для разработки).
+DB_PATH = os.environ.get("DB_PATH", "bot.db")
 
 if not TELEGRAM_TOKEN or not OPENROUTER_API_KEY:
     raise RuntimeError(
@@ -40,11 +46,12 @@ client = OpenAI(
 
 MODEL_NAME = "anthropic/claude-sonnet-4.6"
 
-FREE_MESSAGES_PER_DAY = 5
-STARS_PRICE = 250  # звёзд в месяц (курс плавает, проверь актуальный на момент запуска)
-USDT_PRICE = 5  # долларов в месяц
+FREE_MESSAGES_PER_MONTH = 10
+STARS_PRICE = 250
+USDT_PRICE = 5
 TRONSCAN_API = "https://apilist.tronscanapi.com/api/transaction-info"
-TXID_PATTERN = re.compile(r"^[a-fA-F0-9]{64}$")  # TRC-20 хэш транзакции - всегда 64 hex-символа
+TXID_PATTERN = re.compile(r"^[a-fA-F0-9]{64}$")
+MAX_VERIFY_ATTEMPTS_PER_HOUR = 8
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -54,6 +61,44 @@ questions_handler = logging.FileHandler("questions.log", encoding="utf-8")
 questions_handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
 questions_logger.addHandler(questions_handler)
 questions_logger.setLevel(logging.INFO)
+
+
+# ── База данных ──────────────────────────────────────────────
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    """Создаёт таблицы, если их ещё нет. Безопасно вызывать при каждом запуске."""
+    conn = get_db()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            chat_id INTEGER PRIMARY KEY,
+            expiry TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS daily_usage (
+            chat_id INTEGER NOT NULL,
+            usage_date TEXT NOT NULL,
+            count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (chat_id, usage_date)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS used_txids (
+            txid TEXT PRIMARY KEY,
+            chat_id INTEGER NOT NULL,
+            used_at TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    conn.close()
+    logger.info(f"База данных инициализирована: {DB_PATH}")
+
 
 # ── Системный промпт ──────────────────────────────────────────────
 SYSTEM_PROMPT = """Ты - помощник для предпринимателей на УСН в России, который простым языком объясняет изменения по НДС и УСН, вступившие в силу с 1 января 2026 года. Ты НЕ заменяешь бухгалтера.
@@ -90,7 +135,7 @@ START_MESSAGE = (
     "• «Я на АвтоУСН, надо ли мне вообще платить НДС?»\n"
     "• «Что изменится с лимитами УСН в 2027 году?»\n"
     "• «Есть ли льготы по НДС для IT-компаний?»\n\n"
-    f"У тебя есть {FREE_MESSAGES_PER_DAY} бесплатных вопросов в день.\n\n"
+    f"У тебя есть {FREE_MESSAGES_PER_MONTH} бесплатных вопросов в месяц.\n\n"
     "⚠️ Я не заменяю бухгалтера, а помогаю разобраться в общих правилах.\n\n"
     "Команда /help - подробнее о боте и правилах использования."
 )
@@ -108,7 +153,7 @@ HELP_MESSAGE = (
     "качество ответов бота. Личные данные (кроме имени пользователя Telegram) не запрашиваются "
     "и не передаются третьим лицам.\n\n"
     f"💳 Подписка\n\n"
-    f"Бесплатно: {FREE_MESSAGES_PER_DAY} вопросов в день. "
+    f"Бесплатно: {FREE_MESSAGES_PER_MONTH} вопросов в месяц. "
     f"Безлимитная подписка: {STARS_PRICE} ⭐ или ${USDT_PRICE} в USDT за 30 дней. Оформить: /subscribe\n\n"
     "Возврат средств: если подписка не была активирована по ошибке бота - "
     "напиши в этот же чат, разберёмся индивидуально.\n\n"
@@ -119,60 +164,111 @@ HELP_MESSAGE = (
     "/help - это сообщение"
 )
 
-# ── Хранилища данных (в памяти - для MVP достаточно) ──────────────────
+# История переписки для контекста диалога с ИИ - остаётся в памяти (не критично для бизнеса,
+# короткоживущие данные, не нужно тащить в БД)
 user_histories: dict[int, list[dict]] = {}
 MAX_HISTORY_MESSAGES = 10
 
-user_message_counts: dict[int, dict] = {}
-subscriptions: dict[int, datetime] = {}
-used_txids: set[str] = set()  # чтобы один и тот же платёж нельзя было применить дважды
-usdt_verify_attempts: dict[int, list] = {}  # {chat_id: [timestamp, timestamp, ...]} для анти-спама
+# Анти-спам для попыток проверки платежа - тоже не критично для персистентности
+usdt_verify_attempts: dict[int, list] = {}
 
-MAX_VERIFY_ATTEMPTS_PER_HOUR = 8
 
+# ── Функции работы с БД (подписки, лимиты, платежи) ──────────────────
 
 def has_active_subscription(chat_id: int) -> bool:
-    expiry = subscriptions.get(chat_id)
-    return expiry is not None and expiry > datetime.now()
+    conn = get_db()
+    row = conn.execute("SELECT expiry FROM subscriptions WHERE chat_id = ?", (chat_id,)).fetchone()
+    conn.close()
+    if row is None:
+        return False
+    return datetime.fromisoformat(row["expiry"]) > datetime.now()
+
+
+def get_subscription_expiry(chat_id: int) -> datetime | None:
+    conn = get_db()
+    row = conn.execute("SELECT expiry FROM subscriptions WHERE chat_id = ?", (chat_id,)).fetchone()
+    conn.close()
+    return datetime.fromisoformat(row["expiry"]) if row else None
+
+
+def grant_subscription(chat_id: int, days: int = 30) -> datetime:
+    conn = get_db()
+    row = conn.execute("SELECT expiry FROM subscriptions WHERE chat_id = ?", (chat_id,)).fetchone()
+    current_expiry = datetime.fromisoformat(row["expiry"]) if row else None
+    base = current_expiry if current_expiry and current_expiry > datetime.now() else datetime.now()
+    new_expiry = base + timedelta(days=days)
+
+    conn.execute(
+        "INSERT INTO subscriptions (chat_id, expiry) VALUES (?, ?) "
+        "ON CONFLICT(chat_id) DO UPDATE SET expiry = excluded.expiry",
+        (chat_id, new_expiry.isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    return new_expiry
 
 
 def check_and_increment_limit(chat_id: int) -> bool:
+    """True если лимит не исчерпан или есть активная подписка."""
     if has_active_subscription(chat_id):
         return True
 
-    today = str(date.today())
-    record = user_message_counts.get(chat_id)
+    current_month = date.today().strftime("%Y-%m")
+    conn = get_db()
+    row = conn.execute(
+        "SELECT count FROM daily_usage WHERE chat_id = ? AND usage_date = ?",
+        (chat_id, current_month),
+    ).fetchone()
 
-    if record is None or record["date"] != today:
-        record = {"date": today, "count": 0}
-        user_message_counts[chat_id] = record
+    current_count = row["count"] if row else 0
 
-    if record["count"] >= FREE_MESSAGES_PER_DAY:
+    if current_count >= FREE_MESSAGES_PER_MONTH:
+        conn.close()
         return False
 
-    record["count"] += 1
+    conn.execute(
+        "INSERT INTO daily_usage (chat_id, usage_date, count) VALUES (?, ?, 1) "
+        "ON CONFLICT(chat_id, usage_date) DO UPDATE SET count = count + 1",
+        (chat_id, current_month),
+    )
+    conn.commit()
+    conn.close()
     return True
 
 
 def remaining_free_messages(chat_id: int) -> int:
-    today = str(date.today())
-    record = user_message_counts.get(chat_id)
-    if record is None or record["date"] != today:
-        return FREE_MESSAGES_PER_DAY
-    return max(0, FREE_MESSAGES_PER_DAY - record["count"])
+    current_month = date.today().strftime("%Y-%m")
+    conn = get_db()
+    row = conn.execute(
+        "SELECT count FROM daily_usage WHERE chat_id = ? AND usage_date = ?",
+        (chat_id, current_month),
+    ).fetchone()
+    conn.close()
+    used = row["count"] if row else 0
+    return max(0, FREE_MESSAGES_PER_MONTH - used)
 
 
-def grant_subscription(chat_id: int, days: int = 30) -> None:
-    current_expiry = subscriptions.get(chat_id)
-    base = current_expiry if current_expiry and current_expiry > datetime.now() else datetime.now()
-    subscriptions[chat_id] = base + timedelta(days=days)
+def is_txid_used(txid: str) -> bool:
+    conn = get_db()
+    row = conn.execute("SELECT 1 FROM used_txids WHERE txid = ?", (txid,)).fetchone()
+    conn.close()
+    return row is not None
+
+
+def mark_txid_used(txid: str, chat_id: int) -> None:
+    conn = get_db()
+    conn.execute(
+        "INSERT OR IGNORE INTO used_txids (txid, chat_id, used_at) VALUES (?, ?, ?)",
+        (txid, chat_id, datetime.now().isoformat()),
+    )
+    conn.commit()
+    conn.close()
 
 
 def check_verify_rate_limit(chat_id: int) -> bool:
-    """True если можно попробовать ещё раз, False если превышен лимит попыток в час."""
+    """Анти-спам для попыток проверки платежа - в памяти, не критично для персистентности."""
     now = datetime.now()
     attempts = usdt_verify_attempts.setdefault(chat_id, [])
-    # чистим попытки старше часа
     attempts[:] = [t for t in attempts if now - t < timedelta(hours=1)]
 
     if len(attempts) >= MAX_VERIFY_ATTEMPTS_PER_HOUR:
@@ -183,13 +279,8 @@ def check_verify_rate_limit(chat_id: int) -> bool:
 
 
 def verify_usdt_transaction(txid: str, request_timestamp: float) -> tuple[bool, str]:
-    """
-    Проверяет транзакцию через публичный Tronscan API.
-    request_timestamp - момент, когда пользователь запросил оплату (защита от подмены
-    чужой старой публичной транзакции, случайно найденной в блокчейн-эксплорере).
-    Возвращает (успех, сообщение_с_подробностями).
-    """
-    if txid in used_txids:
+    """Проверяет транзакцию через публичный Tronscan API."""
+    if is_txid_used(txid):
         return False, "Этот хэш транзакции уже был использован ранее."
 
     try:
@@ -202,11 +293,9 @@ def verify_usdt_transaction(txid: str, request_timestamp: float) -> tuple[bool, 
     if not data or data.get("contractRet") != "SUCCESS":
         return False, "Транзакция не найдена или ещё не подтверждена в блокчейне. Подожди пару минут и попробуй снова."
 
-    # Защита от подмены: транзакция должна была произойти ПОСЛЕ того, как пользователь запросил оплату.
-    # Без этого кто угодно мог бы найти чужой старый публичный перевод на этот адрес и подсунуть его хэш.
     tx_timestamp_ms = data.get("timestamp", 0)
     tx_timestamp = tx_timestamp_ms / 1000 if tx_timestamp_ms else 0
-    buffer_seconds = 300  # запас на разницу часов/задержки сети
+    buffer_seconds = 300
     if tx_timestamp and tx_timestamp < (request_timestamp - buffer_seconds):
         return False, (
             "Эта транзакция была совершена до того, как ты запросил оплату. "
@@ -259,12 +348,12 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     if has_active_subscription(chat_id):
-        expiry = subscriptions[chat_id].strftime("%d.%m.%Y")
+        expiry = get_subscription_expiry(chat_id).strftime("%d.%m.%Y")
         await update.message.reply_text(f"У тебя активная подписка до {expiry} 🎉")
     else:
         left = remaining_free_messages(chat_id)
         await update.message.reply_text(
-            f"Осталось бесплатных вопросов сегодня: {left} из {FREE_MESSAGES_PER_DAY}.\n"
+            f"Осталось бесплатных вопросов в этом месяце: {left} из {FREE_MESSAGES_PER_MONTH}.\n"
             "Безлимит: /subscribe"
         )
 
@@ -273,7 +362,7 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
 
     if has_active_subscription(chat_id):
-        expiry = subscriptions[chat_id].strftime("%d.%m.%Y")
+        expiry = get_subscription_expiry(chat_id).strftime("%d.%m.%Y")
         await update.message.reply_text(f"У тебя уже есть активная подписка до {expiry} 🎉")
         return
 
@@ -313,10 +402,6 @@ async def send_stars_invoice(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def send_usdt_instructions(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Инструкция по оплате в USDT. После этого бот переходит в режим ожидания хэша -
-    пользователь просто присылает TXID обычным сообщением, без команд.
-    """
     context.user_data["awaiting_usdt_txid"] = True
     context.user_data["usdt_requested_at"] = datetime.now().timestamp()
 
@@ -348,7 +433,6 @@ async def pay_usdt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def process_usdt_txid(update: Update, context: ContextTypes.DEFAULT_TYPE, txid: str) -> None:
-    """Автоматическая проверка присланного хэша транзакции и выдача подписки."""
     chat_id = update.effective_chat.id
     username = update.effective_user.username or update.effective_user.first_name or str(chat_id)
 
@@ -365,9 +449,9 @@ async def process_usdt_txid(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     success, message = verify_usdt_transaction(txid.strip(), request_timestamp)
 
     if success:
-        used_txids.add(txid.strip())
-        grant_subscription(chat_id, days=30)
-        expiry = subscriptions[chat_id].strftime("%d.%m.%Y")
+        mark_txid_used(txid.strip(), chat_id)
+        expiry_dt = grant_subscription(chat_id, days=30)
+        expiry = expiry_dt.strftime("%d.%m.%Y")
         await update.message.reply_text(
             f"✅ {message}\n\nПодписка активирована до {expiry}. "
             "Теперь можно задавать сколько угодно вопросов."
@@ -408,8 +492,8 @@ async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    grant_subscription(chat_id, days=30)
-    expiry = subscriptions[chat_id].strftime("%d.%m.%Y")
+    expiry_dt = grant_subscription(chat_id, days=30)
+    expiry = expiry_dt.strftime("%d.%m.%Y")
     await update.message.reply_text(
         f"Оплата прошла успешно! ✅ Подписка активна до {expiry}.\n"
         "Теперь можно задавать сколько угодно вопросов."
@@ -417,7 +501,6 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
 
 
 async def grant(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Админ-команда для ручного подтверждения оплаты, на случай если авто-проверка не сработала."""
     caller_id = str(update.effective_chat.id)
     if not ADMIN_CHAT_ID or caller_id != ADMIN_CHAT_ID:
         return
@@ -432,8 +515,8 @@ async def grant(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("chat_id должен быть числом.")
         return
 
-    grant_subscription(target_chat_id, days=30)
-    expiry = subscriptions[target_chat_id].strftime("%d.%m.%Y")
+    expiry_dt = grant_subscription(target_chat_id, days=30)
+    expiry = expiry_dt.strftime("%d.%m.%Y")
     await update.message.reply_text(f"Подписка выдана для {target_chat_id} до {expiry}.")
 
     try:
@@ -453,26 +536,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     username = update.effective_user.username or update.effective_user.first_name or str(chat_id)
     text_stripped = user_text.strip()
 
-    # Хэш транзакции распознаём по формату (64 hex-символа) - это надёжнее,
-    # чем полагаться только на "режим ожидания". Работает даже если пользователь
-    # ошибся в первый раз и присылает исправленный хэш заново, без повторного нажатия кнопки.
     if TXID_PATTERN.match(text_stripped):
         context.user_data["awaiting_usdt_txid"] = False
         await process_usdt_txid(update, context, text_stripped)
         return
 
-    # Если бот ждал хэш, но получил что-то на него не похожее - не молчим и не ломаем диалог,
-    # а мягко поясняем и продолжаем как обычный вопрос (вдруг это правда был вопрос про налоги)
-    was_awaiting_txid = context.user_data.get("awaiting_usdt_txid", False)
-    if was_awaiting_txid:
+    if context.user_data.get("awaiting_usdt_txid", False):
         context.user_data["awaiting_usdt_txid"] = False
 
     questions_logger.info(f"user={username} | chat_id={chat_id} | question={user_text}")
 
     if not check_and_increment_limit(chat_id):
         await update.message.reply_text(
-            f"На сегодня бесплатный лимит в {FREE_MESSAGES_PER_DAY} вопросов исчерпан 🙏\n\n"
-            "Лимит обновится завтра, либо оформи безлимитную подписку: /subscribe"
+            f"Бесплатный лимит в {FREE_MESSAGES_PER_MONTH} вопросов в этом месяце исчерпан 🙏\n\n"
+            "Лимит обновится в следующем месяце, либо оформи безлимитную подписку: /subscribe"
         )
         return
 
@@ -505,7 +582,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def post_init(application: Application) -> None:
-    """Настраивает меню команд, всплывающее у пользователя в Telegram."""
     commands = [
         ("start", "Начать работу с ботом"),
         ("subscribe", "Оформить безлимитную подписку"),
@@ -517,6 +593,8 @@ async def post_init(application: Application) -> None:
 
 
 def main() -> None:
+    init_db()
+
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
