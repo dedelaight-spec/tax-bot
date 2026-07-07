@@ -46,7 +46,7 @@ client = OpenAI(
 
 MODEL_NAME = "anthropic/claude-sonnet-4.6"
 
-FREE_MESSAGES_PER_MONTH = 5
+FREE_MESSAGES_PER_MONTH = 3
 STARS_PRICE = 250
 USDT_PRICE = 5
 TRONSCAN_API = "https://apilist.tronscanapi.com/api/transaction-info"
