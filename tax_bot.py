@@ -95,6 +95,13 @@ def init_db() -> None:
             used_at TEXT NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_sources (
+            chat_id INTEGER PRIMARY KEY,
+            source TEXT NOT NULL,
+            first_seen TEXT NOT NULL
+        )
+    """)
     conn.commit()
     conn.close()
     logger.info(f"База данных инициализирована: {DB_PATH}")
@@ -338,8 +345,24 @@ def verify_usdt_transaction(txid: str, request_timestamp: float) -> tuple[bool, 
 
 # ── Команды ──────────────────────────────────────────────
 
+def save_user_source(chat_id: int, source: str) -> None:
+    """Сохраняет источник привлечения. Только первый источник (INSERT OR IGNORE) -
+    если человек пришёл по одной ссылке, а потом кликнул другую, засчитывается первая."""
+    conn = get_db()
+    conn.execute(
+        "INSERT OR IGNORE INTO user_sources (chat_id, source, first_seen) VALUES (?, ?, ?)",
+        (chat_id, source, datetime.now().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_histories[update.effective_chat.id] = []
+    chat_id = update.effective_chat.id
+    # Deep-link атрибуция: t.me/бот?start=dzen -> context.args = ["dzen"]
+    source = context.args[0][:32] if context.args else "direct"
+    save_user_source(chat_id, source)
+    user_histories[chat_id] = []
     await update.message.reply_text(START_MESSAGE)
 
 
@@ -508,6 +531,50 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
     )
 
 
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Админ-команда: статистика по источникам привлечения и подпискам."""
+    caller_id = str(update.effective_chat.id)
+    if not ADMIN_CHAT_ID or caller_id != ADMIN_CHAT_ID:
+        return
+
+    conn = get_db()
+    source_rows = conn.execute(
+        "SELECT source, COUNT(*) as cnt FROM user_sources GROUP BY source ORDER BY cnt DESC"
+    ).fetchall()
+    total_users = conn.execute("SELECT COUNT(*) FROM user_sources").fetchone()[0]
+    active_subs = conn.execute(
+        "SELECT COUNT(*) FROM subscriptions WHERE expiry > ?",
+        (datetime.now().isoformat(),),
+    ).fetchone()[0]
+    # Подписчики по источникам - самая ценная метрика
+    paying_by_source = conn.execute(
+        """SELECT us.source, COUNT(*) as cnt FROM subscriptions s
+           JOIN user_sources us ON us.chat_id = s.chat_id
+           WHERE s.expiry > ?
+           GROUP BY us.source ORDER BY cnt DESC""",
+        (datetime.now().isoformat(),),
+    ).fetchall()
+    conn.close()
+
+    lines = [f"📊 Статистика бота\n\nВсего пользователей: {total_users}\nАктивных подписок: {active_subs}\n"]
+
+    lines.append("Источники (все пользователи):")
+    if source_rows:
+        for row in source_rows:
+            lines.append(f"  {row['source']}: {row['cnt']}")
+    else:
+        lines.append("  пока пусто")
+
+    lines.append("\nИсточники (платящие):")
+    if paying_by_source:
+        for row in paying_by_source:
+            lines.append(f"  {row['source']}: {row['cnt']}")
+    else:
+        lines.append("  пока нет платящих")
+
+    await update.message.reply_text("\n".join(lines))
+
+
 async def grant(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     caller_id = str(update.effective_chat.id)
     if not ADMIN_CHAT_ID or caller_id != ADMIN_CHAT_ID:
@@ -613,6 +680,7 @@ def main() -> None:
     app.add_handler(CommandHandler("pay_stars", pay_stars))
     app.add_handler(CommandHandler("pay_usdt", pay_usdt))
     app.add_handler(CommandHandler("grant", grant))
+    app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CallbackQueryHandler(subscribe_button_callback))
     app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
