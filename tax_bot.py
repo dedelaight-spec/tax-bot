@@ -11,7 +11,7 @@ import re
 import sqlite3
 import logging
 import requests
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, time as dt_time, timezone
 from openai import OpenAI
 from telegram import Update, LabeledPrice, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -52,6 +52,8 @@ USDT_PRICE = 5
 TRONSCAN_API = "https://apilist.tronscanapi.com/api/transaction-info"
 TXID_PATTERN = re.compile(r"^[a-fA-F0-9]{64}$")
 MAX_VERIFY_ATTEMPTS_PER_HOUR = 8
+BACKUP_DIR = os.path.dirname(os.path.abspath(DB_PATH)) or "."
+BACKUP_RETENTION_DAYS = 3
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -105,6 +107,78 @@ def init_db() -> None:
     conn.commit()
     conn.close()
     logger.info(f"База данных инициализирована: {DB_PATH}")
+
+
+# ── Бэкап базы данных ──────────────────────────────────────────────
+
+def create_db_backup() -> str:
+    """Консистентная копия БД через sqlite3 Connection.backup (не читает живой файл напрямую)."""
+    backup_path = os.path.join(BACKUP_DIR, f"backup-{date.today().isoformat()}.db")
+    source = sqlite3.connect(DB_PATH)
+    try:
+        dest = sqlite3.connect(backup_path)
+        try:
+            source.backup(dest)
+        finally:
+            dest.close()
+    finally:
+        source.close()
+    return backup_path
+
+
+def cleanup_old_backups(retention_days: int = BACKUP_RETENTION_DAYS) -> None:
+    cutoff = datetime.now() - timedelta(days=retention_days)
+    for name in os.listdir(BACKUP_DIR):
+        if not (name.startswith("backup-") and name.endswith(".db")):
+            continue
+        path = os.path.join(BACKUP_DIR, name)
+        if datetime.fromtimestamp(os.path.getmtime(path)) < cutoff:
+            os.remove(path)
+
+
+async def send_db_backup(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Создаёт бэкап БД и отправляет админу документом. Общая логика для job и /backup."""
+    if not ADMIN_CHAT_ID:
+        logger.warning("ADMIN_CHAT_ID не задан в переменных окружения - бэкап пропущен")
+        return
+
+    try:
+        backup_path = create_db_backup()
+        file_size_kb = os.path.getsize(backup_path) / 1024
+
+        conn = get_db()
+        user_count = conn.execute("SELECT COUNT(*) FROM user_sources").fetchone()[0]
+        conn.close()
+
+        caption = (
+            f"🗄 Бэкап базы данных\n\n"
+            f"Дата: {date.today().strftime('%d.%m.%Y')}\n"
+            f"Размер: {file_size_kb:.1f} КБ\n"
+            f"Пользователей: {user_count}"
+        )
+
+        with open(backup_path, "rb") as f:
+            await context.bot.send_document(
+                chat_id=ADMIN_CHAT_ID,
+                document=f,
+                filename=os.path.basename(backup_path),
+                caption=caption,
+            )
+
+        cleanup_old_backups()
+    except Exception:
+        logger.exception("Ошибка при создании/отправке бэкапа базы данных")
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text="⚠️ Не удалось создать/отправить бэкап базы данных. Подробности в логах бота.",
+            )
+        except Exception:
+            logger.exception("Не удалось уведомить админа об ошибке бэкапа")
+
+
+async def backup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_db_backup(context)
 
 
 # ── Системный промпт ──────────────────────────────────────────────
@@ -575,6 +649,14 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n".join(lines))
 
 
+async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Админ-команда: ручной запуск той же логики, что и ежедневный job."""
+    caller_id = str(update.effective_chat.id)
+    if not ADMIN_CHAT_ID or caller_id != ADMIN_CHAT_ID:
+        return
+    await send_db_backup(context)
+
+
 async def grant(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     caller_id = str(update.effective_chat.id)
     if not ADMIN_CHAT_ID or caller_id != ADMIN_CHAT_ID:
@@ -681,10 +763,13 @@ def main() -> None:
     app.add_handler(CommandHandler("pay_usdt", pay_usdt))
     app.add_handler(CommandHandler("grant", grant))
     app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("backup", backup_command))
     app.add_handler(CallbackQueryHandler(subscribe_button_callback))
     app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    app.job_queue.run_daily(backup_job, time=dt_time(hour=3, minute=0, tzinfo=timezone.utc))
 
     logger.info("Бот запущен, ждём сообщения...")
     app.run_polling()
